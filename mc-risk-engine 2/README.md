@@ -1,3 +1,23 @@
+# Monte Carlo Risk Engine
+
+A multi-threaded C++20 engine that estimates one-day portfolio VaR and Expected Shortfall
+by simulation, and — more importantly — **checks whether those estimates are actually
+calibrated** using Kupiec and Christoffersen backtests.
+
+The interesting question in this repo is not "how do I run Monte Carlo". It is: *given
+that every risk model is wrong, which estimator choices survive a statistical test on
+out-of-sample data, and what do they cost in runtime?*
+
+```
+prices → log returns → covariance estimator → matrix factorization
+                                                     ↓
+                       parallel scenario generation (Gaussian / Student-t, antithetic)
+                                                     ↓
+                             P&L distribution → VaR, ES, standard errors
+                                                     ↓
+                                    rolling backtest → Kupiec / Christoffersen
+```
+
 ## Build
 
 ```bash
@@ -135,3 +155,14 @@ architectures as well as across thread counts.
   principled, and the model is somewhat sensitive to it.
 
 ## Layout
+
+```
+include/mcre/matrix.hpp     Matrix, Cholesky, Jacobi eigendecomposition, PSD repair
+include/mcre/stats.hpp      log returns, sample/EWMA/Ledoit-Wolf covariance
+include/mcre/rng.hpp        xoshiro256++, normal (polar), gamma (Marsaglia-Tsang)
+include/mcre/simulator.hpp  parallel scenario generation, block-deterministic seeding
+include/mcre/risk.hpp       VaR/ES with standard errors, Kupiec, Christoffersen
+src/main.cpp                CLI: gen | run | bench | vr | backtest
+tests/test_core.cpp         factorization, MC vs closed form, t-moments, determinism
+tools/fetch_prices.py       real price history → CSV
+```
