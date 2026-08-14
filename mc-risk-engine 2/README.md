@@ -1,23 +1,3 @@
-# Monte Carlo Risk Engine
-
-A multi-threaded C++20 engine that estimates one-day portfolio VaR and Expected Shortfall
-by simulation, and — more importantly — **checks whether those estimates are actually
-calibrated** using Kupiec and Christoffersen backtests.
-
-The interesting question in this repo is not "how do I run Monte Carlo". It is: *given
-that every risk model is wrong, which estimator choices survive a statistical test on
-out-of-sample data, and what do they cost in runtime?*
-
-```
-prices → log returns → covariance estimator → matrix factorization
-                                                     ↓
-                       parallel scenario generation (Gaussian / Student-t, antithetic)
-                                                     ↓
-                             P&L distribution → VaR, ES, standard errors
-                                                     ↓
-                                    rolling backtest → Kupiec / Christoffersen
-```
-
 ## Build
 
 ```bash
@@ -35,7 +15,7 @@ Header-only core (`include/mcre/`), no external dependencies.
       --cov ewma --shocks t --nu 5 --antithetic --alpha 0.99 --threads 8
 ./build/mcre backtest --prices data/prices.csv --cov ewma --shocks t --window 500
 ./build/mcre bench --prices data/prices.csv --draws 20000000 --max-threads 16
-./build/mcre vr   --prices data/prices.csv --draws 200000 --reps 24
+./build/mcre vr   --prices data/prices.csv --draws 200000 --reps 400
 ```
 
 For real data: `python3 tools/fetch_prices.py --tickers ... --out data/real.csv`.
@@ -79,37 +59,65 @@ independence (are exceptions *clustered*?).
 
 ## Results
 
-Synthetic data with volatility clustering, 8 assets, ₹1 crore equal-weighted, 500-day
-rolling window, 99% VaR, 1,999 out-of-sample days. Expected exceptions: 20.
+**Data:** 8 NSE large caps (RELIANCE, HDFCBANK, INFY, TCS, ICICIBANK, ITC, LT, SBIN),
+2015-2026, 2,872 daily observations. Rs 1 crore equal-weighted, 500-day rolling window,
+99% one-day VaR, 2,371 out-of-sample days. Expected exceptions: 23.7.
 
-| Covariance | Shocks | Exceptions | Kupiec LR | Christoffersen LR | Joint |
+| Covariance | Shocks | Exceptions | Kupiec (rate) | Christoffersen (clustering) | Joint |
 |---|---|---|---|---|---|
-| sample | Gaussian | 28 | 2.88 pass | 3.49 pass | 6.38 **fail** |
-| sample | Student-t (ν=5) | 13 | 2.82 pass | 0.17 pass | 2.99 pass |
-| EWMA | Gaussian | 32 | 6.17 **fail** | 6.03 **fail** | 12.20 **fail** |
-| EWMA | Student-t (ν=5) | **21** | 0.05 pass | 0.45 pass | 0.50 pass |
+| sample | Gaussian | 28 | 0.74 pass | **19.50 fail** | 20.24 fail |
+| sample | Student-t (v=5) | 20 | 0.62 pass | 1.97 pass | 2.59 pass |
+| EWMA | Gaussian | 43 | **12.78 fail** | 0.06 pass | 12.83 fail |
+| EWMA | Student-t (v=5) | **24** | **0.004 pass** | 0.49 pass | 0.50 pass |
 
-Two things worth noting. Gaussian shocks under-cover at the 99% level even when the
-covariance is estimated well — the breaches are not just too frequent but *clustered*,
-which is the failure mode that matters operationally. And EWMA makes the Gaussian model
-strictly worse before it makes it better: reacting faster to volatility means the model
-also shrinks its VaR faster after a quiet stretch, and without fat tails that is a
-liability. Only the combination is calibrated.
+The two failure modes are orthogonal, which is the point of running both tests.
 
-Antithetic variates, equal scenario budget (200k), 24 independent replications:
+Equal-weighted covariance passes on breach *rate* and fails independence badly (LR = 19.5):
+it reacts too slowly to volatility, so breaches arrive in clusters around stress episodes.
+A Kupiec test alone would have passed this model.
 
-| Estimator | sd(VaR) | sd(ES) | Variance ratio |
-|---|---|---|---|
-| Plain MC | 432.2 | 505.4 | — |
-| Antithetic | 330.4 | 442.9 | 1.71× (VaR), 1.30× (ES) |
+EWMA fixes the clustering almost completely (19.50 -> 0.06) and simultaneously makes the
+rate much worse (43 breaches, 1.81% against a 1% target). Reacting quickly to volatility
+is not enough when the shock distribution has tails that are too thin.
 
-Less than the textbook speedup, and that is expected: antithetic sampling works by
-cancelling the linear component of the estimator, and a 99% tail quantile is dominated by
-its nonlinear part. It helps ES less than VaR for the same reason.
+Only the combination is calibrated on both axes: EWMA governs *when* breaches occur,
+Student-t governs *how often*.
 
-Throughput, single core (Intel, `-O3 -march=native`), 8 assets: **7.5M scenarios/s**
-(≈60M asset returns/s), with the quantile and ES pass adding ~13% on top. Run
-`mcre bench` for the scaling table on your own machine.
+### Antithetic variates: a measured null result
+
+Equal scenario budget (200k), 400 independent replications, same data:
+
+| Estimator | sd(plain) | sd(antithetic) | Variance ratio | 95% CI | Verdict |
+|---|---|---|---|---|---|
+| mean P&L | 228.8 | 3.21 | 5077x | [4173, 6178] | reduces variance |
+| VaR 99% | 848.8 | 880.5 | 0.93x | [0.76, 1.13] | no detectable effect |
+| ES 99% | 1082 | 1083 | 1.00x | [0.82, 1.21] | no detectable effect |
+
+Antithetic sampling cancels the odd component of an estimator. The sample mean is nearly
+linear in the shocks, so it benefits enormously - the 5000x figure is the control that
+confirms the implementation is correct. A far-tail quantile does not benefit: an
+antithetic pair can essentially never place both members in the 1% tail, so there is no
+cancellation where the estimator actually lives. Writing the indicator covariance out
+gives Var proportional to p(1-2p)/n against p(1-p)/n, a predicted gain of 1.01x at
+p = 0.01, consistent with what is measured.
+
+This is why the tool reports confidence intervals. At 24 replications the interval on the
+VaR ratio spans roughly [0.55, 2.80], wide enough to "show" a 1.7x improvement that does
+not exist. The null result is the finding.
+
+### Throughput
+
+4-core ARM64 VM (Apple Silicon host), `-O3 -march=native`, 8 assets, 20M scenarios:
+
+| Threads | Runtime (s) | M scenarios/s | Speedup | VaR checksum |
+|---|---|---|---|---|
+| 1 | 1.786 | 11.20 | 1.00x | 249843 |
+| 2 | 0.916 | 21.85 | 1.95x | 249843 |
+| 4 | 0.497 | 40.28 | 3.60x | 249843 |
+
+90% parallel efficiency at 4 threads. The identical checksums are the block-deterministic
+seeding working; the same figure appears on x86-64, so results are reproducible across
+architectures as well as across thread counts.
 
 ## Limitations
 
@@ -120,18 +128,10 @@ Throughput, single core (Intel, `-O3 -march=native`), 8 assets: **7.5M scenarios
   would be the next step, and would likely dominate EWMA in the backtest.
 - Linear positions only. Options would need revaluation per scenario rather than a
   weighted sum of returns.
-- The headline table is synthetic data. Numbers on real equities will differ; the
-  backtest harness is the point, not the specific figures.
+- Results are for 8 Indian large caps over one particular decade. The conclusion that
+  EWMA plus fat tails is the calibrated combination should not be assumed to transfer to
+  other markets, asset classes, or periods without rerunning the backtest.
+- `nu = 5` is fixed rather than fitted. A profiled or per-asset estimate would be more
+  principled, and the model is somewhat sensitive to it.
 
 ## Layout
-
-```
-include/mcre/matrix.hpp     Matrix, Cholesky, Jacobi eigendecomposition, PSD repair
-include/mcre/stats.hpp      log returns, sample/EWMA/Ledoit-Wolf covariance
-include/mcre/rng.hpp        xoshiro256++, normal (polar), gamma (Marsaglia-Tsang)
-include/mcre/simulator.hpp  parallel scenario generation, block-deterministic seeding
-include/mcre/risk.hpp       VaR/ES with standard errors, Kupiec, Christoffersen
-src/main.cpp                CLI: gen | run | bench | vr | backtest
-tests/test_core.cpp         factorization, MC vs closed form, t-moments, determinism
-tools/fetch_prices.py       real price history → CSV
-```
